@@ -4,7 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Cek Stok Gudang</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<link rel="preconnect" href="https://firestore.googleapis.com">
+<link rel="preconnect" href="https://www.gstatic.com" crossorigin>
 <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-auth-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore-compat.js"></script>
@@ -67,6 +68,16 @@ th{color:var(--muted);font-weight:500;}
 .skRow .skV{text-align:right;min-width:150px;font-weight:600;}
 .skV.ok{color:var(--ok);} .skV.pay{color:var(--amber);} .skV.na{color:var(--muted);font-weight:400;}
 .skHead{font-size:12px;color:var(--muted);margin-top:4px;line-height:1.6;}
+.searchRow{display:flex;gap:8px;margin-bottom:10px;}
+.searchRow input{margin-bottom:0;flex:1;}
+.searchRow button{padding:9px 14px;}
+.fpanel{display:none;border:1px solid var(--line);border-radius:8px;padding:12px 12px 4px;margin-bottom:12px;background:#161b22;}
+.fpanel.open{display:block;}
+.fpanel .fgTitle{font-size:12px;color:var(--muted);margin:0 0 6px;}
+.fpanel .tabs{flex-wrap:wrap;overflow:visible;margin-bottom:12px;}
+.fpanel .fReset{margin:0 0 12px;}
+.fSummary{font-size:12px;color:var(--amber);margin:-2px 0 12px;}
+.loadNote{font-size:12px;color:var(--amber);margin-bottom:10px;}
 </style>
 </head>
 <body>
@@ -89,6 +100,7 @@ const firebaseConfig = {
 };
 firebase.initializeApp(firebaseConfig);
 const db = firebase.firestore();
+try{ db.settings({experimentalAutoDetectLongPolling:true, merge:true}); }catch(e){}
 const auth = firebase.auth();
 
 /* PIN yang diketik staff akan otomatis login memakai akun Firebase di bawah ini.
@@ -108,7 +120,8 @@ let state = {
   itemsIndex: {}, serialIndex: {}, cabangIndex: {}, barcodeIndex: {},
   manualIndex: {}, knownDescSet: new Set(),
   staffMode: false, tab: 'upload', showLogin: false, loginErr: '',
-  categoryFilter: null, xsOnly: false, query: '', loaded: false,
+  filters: {brand:[], jenis:[], tipe:[], harga:[], status:[], xs:[]}, filterOpen: false, pending: 0, loadFail: false,
+  query: '', loaded: false, dataVer: 0,
   publicView: 'stok', promotorBrand: null,
   leasingHeader: null, leasingRows: [], leasingUpdated: '', leasingErr: '', skemaQuery: '', skemaProvider: null
 };
@@ -186,10 +199,11 @@ async function pushToFirestore(collectionName, rows, metaKey, onProgress, chunkS
   idbSet(metaKey, { updatedAt, rows }); // simpan ke cache lokal juga supaya viewer lain yg reload cepat
   return updatedAt;
 }
-async function loadFromFirestore(collectionName, metaKey, tagChunk){
+async function loadFromFirestore(collectionName, metaKey, tagChunk, knownUpdatedAt){
   const metaSnap = await db.collection('meta').doc(metaKey).get();
   if(!metaSnap.exists) return { rows: [], updatedAt: '' };
   const { chunkCount, updatedAt } = metaSnap.data();
+  if(knownUpdatedAt && knownUpdatedAt === updatedAt) return { same: true, updatedAt };
 
   const cached = await idbGet(metaKey);
   if(cached && cached.updatedAt === updatedAt){
@@ -211,22 +225,52 @@ async function loadFromFirestore(collectionName, metaKey, tagChunk){
 }
 function fmtDate(iso){ return iso ? new Date(iso).toLocaleString('id-ID') : ''; }
 
+const DATA_SETS = [
+  {key:'priceList',     field:'items',         upd:'itemsUpdated'},
+  {key:'serialNumber',  field:'serialNumber',  upd:'serialUpdated'},
+  {key:'stockCabang',   field:'stockCabang',   upd:'cabangUpdated'},
+  {key:'barcode',       field:'barcode',       upd:'barcodeUpdated'},
+  {key:'manualSupport', field:'manualSupport', upd:'manualSupportUpdated'}
+];
+const _ver = {};
+let _rebuildTimer = null;
+function scheduleRebuild(){
+  clearTimeout(_rebuildTimer);
+  _rebuildTimer = setTimeout(()=>{ buildIndices(); refreshAfterLoad(); }, 40);
+}
+// Setelah data berubah: perbarui info & hasil tanpa membuang kotak pencarian yang sedang diketik.
+function refreshAfterLoad(){
+  const hint = document.getElementById('dataHint');
+  if(hint && document.getElementById('resultBody')){
+    hint.innerHTML = stokHintHtml();
+    refreshFilterUi();
+    runSearchAndRenderBody();
+  } else if(state.tab !== 'upload' || !state.staffMode){ render(); }
+}
+// Tampilkan data dari cache lokal dulu (instan), baru cek versi terbaru di server di latar belakang
+// dan hanya unduh dataset yang memang sudah berubah.
 async function loadAll(){
-  const [pl, sn, sc, bc, ms] = await Promise.all([
-    loadFromFirestore('priceList', 'priceList'),
-    loadFromFirestore('serialNumber', 'serialNumber'),
-    loadFromFirestore('stockCabang', 'stockCabang'),
-    loadFromFirestore('barcode', 'barcode'),
-    loadFromFirestore('manualSupport', 'manualSupport')
-  ]);
-  state.items = pl.rows; state.itemsUpdated = fmtDate(pl.updatedAt);
-  state.serialNumber = sn.rows; state.serialUpdated = fmtDate(sn.updatedAt);
-  state.stockCabang = sc.rows; state.cabangUpdated = fmtDate(sc.updatedAt);
-  state.barcode = bc.rows; state.barcodeUpdated = fmtDate(bc.updatedAt);
-  state.manualSupport = ms.rows; state.manualSupportUpdated = fmtDate(ms.updatedAt);
-  buildIndices();
   state.loaded = true;
+  const caches = await Promise.all(DATA_SETS.map(d=> idbGet(d.key)));
+  let any = false;
+  DATA_SETS.forEach((d,i)=>{
+    const c = caches[i];
+    if(c && c.rows){ state[d.field] = c.rows; state[d.upd] = fmtDate(c.updatedAt); _ver[d.key] = c.updatedAt; any = true; }
+  });
+  if(any) buildIndices();
+  state.pending = DATA_SETS.length;
   render();
+  await Promise.all(DATA_SETS.map(async d=>{
+    try{
+      const r = await loadFromFirestore(d.key, d.key, false, _ver[d.key]);
+      if(!r.same){
+        state[d.field] = r.rows || []; state[d.upd] = fmtDate(r.updatedAt); _ver[d.key] = r.updatedAt;
+        scheduleRebuild();
+      }
+    }catch(e){ state.loadFail = true; }
+    state.pending--;
+    if(state.pending === 0) refreshAfterLoad();
+  }));
 }
 
 function buildIndices(){
@@ -249,6 +293,7 @@ function buildIndices(){
   state.stockCabang.forEach(sc=> known.add(sc._dsL));
   state.barcode.forEach(bc=> known.add(bc._dsL));
   state.knownDescSet = known;
+  state.dataVer++;
 }
 
 // ---------------- Auth ----------------
@@ -343,26 +388,131 @@ function renderLoginOverlay(){
 
 // Kategori yang tombol filternya disembunyikan (itemnya tetap bisa dicari lewat kotak pencarian)
 const HIDDEN_CATEGORIES = new Set(['BDL','FIX','HDH','OPR','SPR']);
-function getCategories(){
-  const set = new Set();
+let _catMemo = {v:-1, cats:[], brands:[]};
+function memoFilterOptions(){
+  if(_catMemo.v === state.dataVer) return _catMemo;
+  const cats = new Set(), brands = new Set();
   [state.itemsIndex, state.serialIndex, state.cabangIndex, state.barcodeIndex].forEach(idx=>{
-    Object.keys(idx).forEach(k=>{ const p=k.split('.')[0]; if(p && !HIDDEN_CATEGORIES.has(p)) set.add(p); });
+    Object.keys(idx).forEach(k=>{
+      const parts = k.split('.');
+      const p = parts[0];
+      if(p && !HIDDEN_CATEGORIES.has(p)) cats.add(p);
+      if(parts[1] && !/^\d+$/.test(parts[1])) brands.add(parts[1]);
+    });
   });
-  if(set.has('GAD')) set.add('GAD-LDU'); // GAD dipisah: GAD biasa vs GAD berawalan LDU
-  return Array.from(set).sort();
+  if(cats.has('GAD')) cats.add('GAD-LDU');
+  _catMemo = {v: state.dataVer, cats: Array.from(cats).sort(), brands: Array.from(brands).sort()};
+  return _catMemo;
 }
-function isLduItem(itemNo){
-  const r = (state.itemsIndex[itemNo]||[])[0] || (state.serialIndex[itemNo]||[])[0] || (state.cabangIndex[itemNo]||[])[0] || (state.barcodeIndex[itemNo]||[])[0];
-  return !!(r && /^\s*ldu\b/i.test(r.deskripsi||''));
+function getCategories(){ return memoFilterOptions().cats; }
+const BRAND_NAMES = {APL:'Apple',SAM:'Samsung',XMI:'Xiaomi',IFX:'Infinix',VIV:'Vivo',OPO:'Oppo',HWI:'Huawei',RLM:'Realme',TCN:'Tecno',ANK:'Anker',ADV:'Advan',UNI:'Universal'};
+const JENIS_OPTS = [
+  {id:'charger', label:'Charger (TC)',  tok:['TC']},
+  {id:'laptop',  label:'Laptop (NB)',   tok:['NB']},
+  {id:'case',    label:'Case (SLK/FC)', tok:['SLK','FC']},
+  {id:'headset', label:'Headset (HF)',  tok:['HF']}
+];
+// batas atas inklusif, dalam rupiah
+const HARGA_OPTS = [
+  {id:'h1', label:'0 - 1jt',  lo:0,        hi:1000000},
+  {id:'h2', label:'1 - 2jt',  lo:1000000,  hi:2000000},
+  {id:'h3', label:'2 - 3jt',  lo:2000000,  hi:3000000},
+  {id:'h4', label:'3 - 4jt',  lo:3000000,  hi:4000000},
+  {id:'h5', label:'4 - 5jt',  lo:4000000,  hi:5000000},
+  {id:'h6', label:'5 - 7jt',  lo:5000000,  hi:7000000},
+  {id:'h7', label:'7 - 10jt', lo:7000000,  hi:10000000},
+  {id:'h8', label:'> 10jt',   lo:10000000, hi:Infinity}
+];
+const STATUS_OPTS = [
+  {id:'ready',        label:'Ready'},
+  {id:'ready-indent', label:'Ready-Indent'},
+  {id:'indent',       label:'Indent'}
+];
+function descOfKey(k){
+  const r = (state.itemsIndex[k]||[])[0] || (state.serialIndex[k]||[])[0] || (state.cabangIndex[k]||[])[0] || (state.barcodeIndex[k]||[])[0];
+  return r ? (r.deskripsi||'') : '';
 }
-function catChipsHtml(){
-  const cats = getCategories();
-  if(!cats.length) return '';
-  const chip = (id,label) => `<div class="tab ${state.categoryFilter===id?'active':''}" data-cat="${id===null?'':id}">${label}</div>`;
-  const xsChip = `<div class="tab ${state.xsOnly?'active':''}" data-xs="1">(XS)</div>`;
-  return `<div class="tabs catRow">${chip(null,'Semua')}${cats.map(c=>chip(c, c==='GAD-LDU' ? 'GAD LDU' : c)).join('')}${xsChip}</div>`;
+function isLduDesc(desc){ return /^\s*ldu\b/i.test(desc||''); }
+function itemTipe(k, desc){
+  const t = k.split('.')[0];
+  if(t === 'GAD') return isLduDesc(desc) ? 'GAD-LDU' : 'GAD';
+  return t;
 }
-
+function itemJenis(desc){
+  const tok = String(desc||'').trim().replace(/^ldu\s+/i,'').split(/\s+/)[0].toUpperCase();
+  const out = [];
+  JENIS_OPTS.forEach(j=>{ if(j.tok.includes(tok)) out.push(j.id); });
+  return out;
+}
+function recPrice(rec){
+  const row = rec.plRows.find(r=> (r.harga||0) > 0);
+  return row ? row.harga : (rec.manualHarga || 0);
+}
+function recStatus(rec){
+  const ready = rec.plRows.some(r=> (r.available||0) > 0);
+  if(ready) return rec.otherGudang.size ? 'ready-indent' : 'ready';
+  return rec.otherGudang.size ? 'indent' : '';
+}
+function filterCount(){
+  const f = state.filters;
+  return f.brand.length + f.jenis.length + f.tipe.length + f.harga.length + f.status.length + f.xs.length;
+}
+function filtersActive(){ return filterCount() > 0; }
+function optLabel(group, v){
+  if(group==='brand') return BRAND_NAMES[v] ? v+' - '+BRAND_NAMES[v] : v;
+  if(group==='tipe') return v==='GAD-LDU' ? 'GAD LDU' : v;
+  const list = group==='jenis' ? JENIS_OPTS : group==='harga' ? HARGA_OPTS : group==='status' ? STATUS_OPTS : null;
+  if(list){ const o = list.find(x=>x.id===v); return o ? o.label : v; }
+  return v;
+}
+function filterSummaryText(){
+  const f = state.filters, parts = [];
+  ['brand','jenis','tipe','harga','status','xs'].forEach(g=> f[g].forEach(v=> parts.push(g==='xs' ? '(XS)' : optLabel(g,v))));
+  return parts.join(' · ');
+}
+function filterChip(group, id, label){
+  const on = state.filters[group].includes(id);
+  return `<div class="tab ${on?'active':''}" data-fg="${group}" data-fv="${escHtml(id)}">${escHtml(label)}</div>`;
+}
+function filterPanelHtml(){
+  const opts = memoFilterOptions();
+  const grp = (title, group, items)=> items.length ? `<div class="fgTitle">${title}</div><div class="tabs">${items.map(([id,l])=>filterChip(group,id,l)).join('')}</div>` : '';
+  return grp('Brand','brand', opts.brands.map(b=>[b,optLabel('brand',b)]))
+    + grp('Jenis','jenis', JENIS_OPTS.map(o=>[o.id,o.label]))
+    + grp('Tipe','tipe', opts.cats.map(c=>[c,optLabel('tipe',c)]))
+    + grp('Range harga','harga', HARGA_OPTS.map(o=>[o.id,o.label]))
+    + grp('Status','status', STATUS_OPTS.map(o=>[o.id,o.label]))
+    + grp('Khusus','xs', [['xs','(XS)']])
+    + `<button class="ghost small fReset" id="fReset" type="button">Reset filter</button>`;
+}
+function filterBtnLabel(){ const n = filterCount(); return n ? `Filter (${n})` : 'Filter'; }
+function refreshFilterUi(){
+  const btn = document.getElementById('filterBtn'); if(btn) btn.textContent = filterBtnLabel();
+  const sm = document.getElementById('filterSummary');
+  if(sm){ const t = filterSummaryText(); sm.textContent = t; sm.style.display = t ? 'block' : 'none'; }
+  const panel = document.getElementById('filterPanel');
+  if(panel) panel.innerHTML = filterPanelHtml();
+  bindFilterChips();
+}
+function bindFilterChips(){
+  document.querySelectorAll('#filterPanel .tab').forEach(chip=>{
+    chip.onclick = ()=>{
+      const g = chip.dataset.fg, v = chip.dataset.fv, arr = state.filters[g];
+      const i = arr.indexOf(v);
+      if(i>=0) arr.splice(i,1); else arr.push(v);
+      chip.classList.toggle('active');
+      const btn = document.getElementById('filterBtn'); if(btn) btn.textContent = filterBtnLabel();
+      const sm = document.getElementById('filterSummary');
+      if(sm){ const t = filterSummaryText(); sm.textContent = t; sm.style.display = t ? 'block' : 'none'; }
+      runSearchAndRenderBody();
+    };
+  });
+  const rs = document.getElementById('fReset');
+  if(rs) rs.onclick = ()=>{
+    Object.keys(state.filters).forEach(g=> state.filters[g] = []);
+    refreshFilterUi(); runSearchAndRenderBody();
+  };
+}
 function getGadBrands(){
   const set = new Set();
   state.items.forEach(it=>{
@@ -403,19 +553,25 @@ function bindPromotor(){
   });
 }
 
-function stokView(){
-  return `<div class="card">
-    <h2>Cek Harga & Stok</h2>
-    <div class="hint">
-      ${state.itemsUpdated ? 'Price list: '+state.itemsUpdated : 'Price list belum ada.'}
+function stokHintHtml(){
+  const loadingNote = state.pending > 0 ? '<div class="loadNote">Memeriksa data terbaru... hasil bisa belum lengkap.</div>' : (state.loadFail ? '<div class="loadNote">Sebagian data gagal dimuat, coba muat ulang halaman.</div>' : '');
+  return `${state.itemsUpdated ? 'Price list: '+state.itemsUpdated : 'Price list belum ada.'}
       ${state.serialUpdated ? ' &middot; Serial: '+state.serialUpdated : ''}
       ${state.cabangUpdated ? ' &middot; Cabang lain: '+state.cabangUpdated : ''}
       ${state.manualSupportUpdated ? ' &middot; Pendukung manual: '+state.manualSupportUpdated : ''}
-      ${state.barcodeUpdated ? ' &middot; Barcode: '+state.barcodeUpdated : ''}
+      ${state.barcodeUpdated ? ' &middot; Barcode: '+state.barcodeUpdated : ''}${loadingNote}`;
+}
+function stokView(){
+  return `<div class="card">
+    <h2>Cek Harga & Stok</h2>
+    <div class="hint" id="dataHint">${stokHintHtml()}</div>
+    <div class="searchRow">
+      <input type="text" id="searchBox" value="${state.query.replace(/"/g,'&quot;')}" placeholder="Ketik Item No., Item Description, Barcode, atau Serial Number...">
+      <button class="ghost" id="filterBtn" type="button">${filterBtnLabel()}</button>
     </div>
-    <input type="text" id="searchBox" value="${state.query.replace(/"/g,'&quot;')}" placeholder="Ketik Item No., Item Description, Barcode, atau Serial Number...">
-    ${catChipsHtml()}
-    <div id="resultBody">${(state.items.length||state.serialNumber.length||state.stockCabang.length) ? '<div class="muted">Ketik untuk mulai mencari, atau pilih kategori.</div>' : '<div class="muted">Belum ada data.</div>'}</div>
+    <div class="fSummary" id="filterSummary" style="display:${filtersActive()?'block':'none'}">${escHtml(filterSummaryText())}</div>
+    <div class="fpanel ${state.filterOpen?'open':''}" id="filterPanel">${filterPanelHtml()}</div>
+    <div id="resultBody"></div>
   </div>`;
 }
 
@@ -428,7 +584,7 @@ function parseTgl(str){
   const dt = new Date(y, m-1, d);
   return isNaN(dt.getTime()) ? null : dt;
 }
-function buildResults(q, category){
+function buildResults(q){
   q = q.toLowerCase();
   let keySet, manualOnlyKeys = [];
   if(q){
@@ -445,9 +601,16 @@ function buildResults(q, category){
     keySet = new Set([...Object.keys(state.itemsIndex), ...Object.keys(state.serialIndex), ...Object.keys(state.cabangIndex), ...Object.keys(state.barcodeIndex)]);
   }
   let keys = Array.from(keySet);
-  if(category === 'GAD') keys = keys.filter(k => k.split('.')[0] === 'GAD' && !isLduItem(k));
-  else if(category === 'GAD-LDU') keys = keys.filter(k => k.split('.')[0] === 'GAD' && isLduItem(k));
-  else if(category){ keys = keys.filter(k => k.split('.')[0] === category); }
+  const F = state.filters;
+  if(F.tipe.length || F.brand.length || F.jenis.length){
+    keys = keys.filter(k=>{
+      const desc = descOfKey(k);
+      if(F.tipe.length && !F.tipe.includes(itemTipe(k, desc))) return false;
+      if(F.brand.length && !F.brand.includes(k.split('.')[1])) return false;
+      if(F.jenis.length && !itemJenis(desc).some(j=>F.jenis.includes(j))) return false;
+      return true;
+    });
+  }
   const results = keys.map(itemNo=>{
     const plRows = state.itemsIndex[itemNo] || [];
     const snRows = state.serialIndex[itemNo] || [];
@@ -480,8 +643,18 @@ function buildResults(q, category){
       manualHarga: m.harga||0, plRows: [], ownByGudang: {}, otherGudang: new Set(m.gudangList||[]), manualOnly: true
     };
   });
-  const all = results.concat(manualOnlyResults);
-  return state.xsOnly ? all.filter(r=> /\(\s*xs\s*\)/i.test(r.deskripsi||'')) : all;
+  // item "data manual" tidak punya Item No. asli, jadi tidak ikut filter brand/tipe, tapi tetap bisa difilter jenis
+  let manualPart = manualOnlyResults;
+  if(F.tipe.length || F.brand.length) manualPart = [];
+  else if(F.jenis.length) manualPart = manualPart.filter(r=> itemJenis(r.deskripsi).some(j=>F.jenis.includes(j)));
+  let all = results.concat(manualPart);
+  if(F.xs.length) all = all.filter(r=> /\(\s*xs\s*\)/i.test(r.deskripsi||''));
+  if(F.harga.length){
+    const bands = HARGA_OPTS.filter(o=>F.harga.includes(o.id));
+    all = all.filter(r=>{ const pr = recPrice(r); return pr > 0 && bands.some(b=> pr > b.lo && pr <= b.hi); });
+  }
+  if(F.status.length) all = all.filter(r=> F.status.includes(recStatus(r)));
+  return all;
 }
 function itemCardHtml(rec){
   const plTable = rec.plRows.length ? `
@@ -523,13 +696,13 @@ function runSearchAndRenderBody(){
   const body = document.getElementById('resultBody');
   if(!body) return;
   const q = state.query.trim();
-  if(!q && !state.categoryFilter && !state.xsOnly){
-    body.innerHTML = (state.items.length||state.serialNumber.length||state.stockCabang.length) ?
-      '<div class="muted">Ketik untuk mulai mencari, atau pilih kategori.</div>' : '<div class="muted">Belum ada data.</div>';
+  const hasData = state.items.length||state.serialNumber.length||state.stockCabang.length;
+  if(!q && !filtersActive()){
+    body.innerHTML = hasData ? '<div class="muted">Ketik untuk mulai mencari, atau buka Filter.</div>' : (state.pending>0 ? '<div class="muted">Memuat data...</div>' : '<div class="muted">Belum ada data.</div>');
     return;
   }
-  const results = buildResults(q, state.categoryFilter);
-  if(!results.length){ body.innerHTML = '<div class="muted">Tidak ditemukan.</div>'; return; }
+  const results = buildResults(q);
+  if(!results.length){ body.innerHTML = state.pending>0 && !hasData ? '<div class="muted">Memuat data...</div>' : '<div class="muted">Tidak ditemukan.</div>'; return; }
   const shown = results.slice(0, RESULT_CAP);
   let html = shown.map(itemCardHtml).join('');
   if(results.length > RESULT_CAP) html += `<div class="muted">Menampilkan ${RESULT_CAP} dari ${results.length} hasil.</div>`;
@@ -538,14 +711,12 @@ function runSearchAndRenderBody(){
 function bindStok(){
   const box = document.getElementById('searchBox');
   box.oninput = ()=>{ state.query = box.value; clearTimeout(searchTimer); searchTimer = setTimeout(runSearchAndRenderBody, 200); };
-  document.querySelectorAll('.catRow .tab').forEach(chip=>{
-    chip.onclick = ()=>{
-      if(chip.dataset.xs){ state.xsOnly = !state.xsOnly; render(); return; }
-      const cat = chip.dataset.cat || null;
-      state.categoryFilter = (cat===null) ? null : (state.categoryFilter===cat ? null : cat);
-      render();
-    };
-  });
+  const btn = document.getElementById('filterBtn');
+  btn.onclick = ()=>{
+    state.filterOpen = !state.filterOpen;
+    document.getElementById('filterPanel').classList.toggle('open', state.filterOpen);
+  };
+  bindFilterChips();
   runSearchAndRenderBody();
 }
 
